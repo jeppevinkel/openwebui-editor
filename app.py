@@ -67,8 +67,6 @@ def _html_encode_reasoning(text):
     default.
     """
     escaped = html.escape(text, quote=True)
-    # html.escape never produces "'" in its output, so this replacement
-    # is safe and will only touch apostrophes that originated in the text.
     escaped = escaped.replace("'", "&#x27;")
     return escaped
 
@@ -89,13 +87,10 @@ def rebuild_content_from_output(blocks):
     Rules confirmed from live database rows:
       - The reasoning text is HTML-entity-encoded before being prefixed.
       - Every line (including blank ones) is prefixed with "&gt; "
-        (ampersand-gt-semicolon-space).  Blank lines therefore become
-        the four characters "&gt; " with a trailing space.
+        (ampersand-gt-semicolon-space).
       - The summary always reads "Thought for N seconds" — Open WebUI
         uses the plural even when N == 1.
-      - The stored `duration` field is used directly; the difference
-        between started_at / ended_at does not always round to the same
-        integer.
+      - The stored `duration` field is used directly.
 
     Message blocks contribute their plain text directly (no encoding).
 
@@ -116,22 +111,14 @@ def rebuild_content_from_output(blocks):
                     reasoning_text = item.get('text', '')
                     break
 
-            # Use the stored duration field directly.
-            # Computing round(ended_at - started_at) does not reproduce the
-            # stored value reliably (e.g. 1.59 s rounds to 2, but the field
-            # stores 1).
             duration = int(block.get('duration') or 0)
 
-            # HTML-encode the reasoning text, then prefix every line with
-            # "&gt; " — blank lines become "&gt; " (trailing space included
-            # because the f-string always appends the line, which is "").
             encoded = _html_encode_reasoning(reasoning_text)
             quoted_lines = '\n'.join(
                 f'&gt; {line}'
                 for line in encoded.splitlines()
             )
 
-            # Always "seconds" — Open WebUI uses the plural unconditionally.
             parts.append(
                 f'<details type="reasoning" done="true" duration="{duration}">\n'
                 f'<summary>Thought for {duration} seconds</summary>\n'
@@ -173,6 +160,48 @@ def output_blocks_for_template(blocks):
     return result
 
 
+def find_history_key(history_msgs, output_blocks, created_at_ms):
+    """
+    Find the key in history_msgs that corresponds to a chat_message row.
+
+    The chat_message.id and the history key are different UUIDs, so we
+    match on shared data instead.
+
+    Strategy 1 — output block IDs (most reliable):
+        Both the chat_message.output column and history[key].output contain
+        the same API-generated block IDs (e.g. "r_abc123", "msg_xyz789").
+        We collect all block IDs from the chat_message output and scan
+        history entries for any match.
+
+    Strategy 2 — timestamp fallback:
+        chat_message.created_at is milliseconds; history[key].timestamp is
+        seconds.  We round-trip and compare.
+
+    Returns the matching key string, or None if not found.
+    """
+    # --- Strategy 1: match by output block IDs ---
+    target_ids = set()
+    for block in output_blocks:
+        bid = block.get('id')
+        if bid:
+            target_ids.add(bid)
+
+    if target_ids:
+        for key, hist_msg in history_msgs.items():
+            for block in hist_msg.get('output', []):
+                if block.get('id') in target_ids:
+                    return key
+
+    # --- Strategy 2: timestamp fallback ---
+    if created_at_ms:
+        target_ts = created_at_ms // 1000
+        for key, hist_msg in history_msgs.items():
+            if hist_msg.get('timestamp') == target_ts:
+                return key
+
+    return None
+
+
 def rebuild_messages_list(history):
     """
     Walk the history tree from root to currentId and return the flat
@@ -188,8 +217,7 @@ def rebuild_messages_list(history):
     if not current_id or not messages_dict:
         return []
 
-    # Walk backwards from currentId to root, then reverse to get
-    # root -> currentId order.
+    # Walk backwards from currentId to root, then reverse.
     path = []
     node_id = current_id
     seen = set()
@@ -212,33 +240,42 @@ def rebuild_messages_list(history):
     return result
 
 
-def update_chat_column(db, chat_id, message_id, plain_content, updated_blocks):
+def update_chat_column(db, chat_id, output_blocks, created_at_ms,
+                       plain_content, updated_blocks):
     """
     Sync the edit back into the chat table's chat JSON column.
 
-    Two locations inside that JSON are updated:
-      1. history.messages[message_id].content  — plain string (not JSON-encoded)
-      2. history.messages[message_id].output   — list of blocks
-      3. messages[]                             — flat list rebuilt from history tree
+    Locates the correct history entry by matching output block IDs (or
+    timestamp as a fallback), then updates:
+      1. history.messages[key].content  — plain string
+      2. history.messages[key].output   — list of blocks
+      3. messages[]                     — flat list rebuilt from history tree
     """
     row = db.execute('SELECT chat FROM chat WHERE id = ?', (chat_id,)).fetchone()
     if not row or not row['chat']:
         return
 
     try:
-        chat_data     = json.loads(row['chat'])
-        history       = chat_data.get('history', {})
-        history_msgs  = history.get('messages', {})
+        chat_data    = json.loads(row['chat'])
+        history      = chat_data.get('history', {})
+        history_msgs = history.get('messages', {})
 
-        if message_id not in history_msgs:
-            # Message exists in chat_message but not in chat.history — skip
-            # silently; the tables are already out of sync for another reason.
+        hist_key = find_history_key(history_msgs, output_blocks, created_at_ms)
+
+        if hist_key is None:
+            app.logger.warning(
+                'update_chat_column: could not locate history entry for '
+                'chat_id=%s — chat.history not updated', chat_id
+            )
+            flash('Warning: could not locate message in chat history — '
+                  'chat_message table was saved but chat history was not updated.',
+                  'error')
             return
 
         # 1 & 2 — update the history node
-        history_msgs[message_id]['content'] = plain_content
+        history_msgs[hist_key]['content'] = plain_content
         if updated_blocks:
-            history_msgs[message_id]['output'] = updated_blocks
+            history_msgs[hist_key]['output'] = updated_blocks
 
         history['messages']  = history_msgs
         chat_data['history'] = history
@@ -254,7 +291,6 @@ def update_chat_column(db, chat_id, message_id, plain_content, updated_blocks):
         )
 
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
-        # Log but don't abort — chat_message has already been saved correctly.
         app.logger.warning('Could not update chat.chat column: %s', exc)
         flash('Warning: chat history column could not be updated.', 'error')
 
@@ -362,7 +398,6 @@ def edit_message(message_id):
             if is_plain:
                 new_content = json.dumps(plain_content)
             else:
-                # Was a JSON object/array — try to round-trip it
                 try:
                     new_content = json.dumps(json.loads(plain_content))
                 except json.JSONDecodeError:
@@ -370,7 +405,8 @@ def edit_message(message_id):
                     db.close()
                     return redirect(url_for('edit_message', message_id=message_id))
 
-        new_output = json.dumps(updated_blocks) if updated_blocks else msg['output']
+        new_output   = json.dumps(updated_blocks) if updated_blocks else msg['output']
+        created_at_ms = msg['created_at']
         ts = int(datetime.now().timestamp() * 1000)
 
         # --- Save chat_message row ---
@@ -380,7 +416,13 @@ def edit_message(message_id):
         )
 
         # --- Sync the chat table's JSON column ---
-        update_chat_column(db, chat_id, message_id, plain_content, updated_blocks)
+        # Pass the original blocks (before edit) for ID-based matching, plus
+        # the updated blocks to write back.
+        update_chat_column(
+            db, chat_id,
+            original_blocks, created_at_ms,
+            plain_content, updated_blocks
+        )
 
         db.commit()
         db.close()
