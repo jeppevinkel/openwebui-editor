@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}Chat DB Editor{% endblock %}</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #111113;
+      --surface:  #1c1c1f;
+      --border:   #2e2e33;
+      --text:     #e2e2e5;
+      --muted:    #888893;
+      --accent:   #5b8df6;
+      --success:  #4ade80;
+      --error:    #f87171;
+      --warning:  #fb923c;
+      --radius:   6px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* Nav */
+    nav {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1.5rem;
+      height: 48px;
+    }
+    nav .brand { font-weight: 700; font-size: 15px; color: var(--text); }
+    nav a { color: var(--muted); font-size: 13px; }
+    nav a:hover { color: var(--text); text-decoration: none; }
+
+    /* Layout */
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem 1.5rem; }
+
+    /* Flashed messages */
+    .flash-list { list-style: none; margin-bottom: 1.25rem; }
+    .flash {
+      padding: .6rem 1rem;
+      border-radius: var(--radius);
+      margin-bottom: .5rem;
+      font-size: 13px;
+    }
+    .flash.success { background: #14532d44; border: 1px solid #4ade8055; color: var(--success); }
+    .flash.error   { background: #7f1d1d44; border: 1px solid #f8717155; color: var(--error); }
+
+    /* Cards */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .card-title { font-weight: 600; margin-bottom: .25rem; }
+    .card-meta  { color: var(--muted); font-size: 12px; }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: .4rem;
+      padding: .45rem .9rem;
+      border-radius: var(--radius);
+      border: 1px solid transparent;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn:hover { opacity: .85; text-decoration: none; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-ghost   { background: transparent; border-color: var(--border); color: var(--text); }
+
+    /* Forms */
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: .3rem; font-weight: 500; letter-spacing: .03em; text-transform: uppercase; }
+    textarea, input[type=text], input[type=search] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: ui-monospace, 'Cascadia Code', monospace;
+      font-size: 13px;
+      padding: .6rem .8rem;
+      resize: vertical;
+      transition: border-color .15s;
+    }
+    textarea:focus, input:focus { outline: none; border-color: var(--accent); }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      padding: .15rem .5rem;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .badge-user      { background: #1e3a5f; color: #93c5fd; }
+    .badge-assistant { background: #1a3a2a; color: #6ee7b7; }
+    .badge-system    { background: #3a2a1a; color: #fcd34d; }
+    .badge-reasoning { background: #2d1a3a; color: #c4b5fd; }
+    .badge-message   { background: #1a2a3a; color: #7dd3fc; }
+
+    /* Misc */
+    .page-header { margin-bottom: 1.5rem; }
+    .page-header h1 { font-size: 1.3rem; font-weight: 700; margin-bottom: .2rem; }
+    .page-header p  { color: var(--muted); font-size: 13px; }
+    .divider { border: none; border-top: 1px solid var(--border); margin: 1.5rem 0; }
+    .block-section { margin-bottom: 1.5rem; }
+    .block-label {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      margin-bottom: .5rem;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .note { font-size: 12px; color: var(--muted); margin-top: .35rem; }
+    .row  { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <nav>
+    <span class="brand">Chat DB Editor</span>
+    <a href="{{ url_for('index') }}">All Chats</a>
+  </nav>
+
+  <div class="container">
+    {% with msgs = get_flashed_messages(with_categories=true) %}
+      {% if msgs %}
+        <ul class="flash-list">
+          {% for cat, msg in msgs %}
+            <li class="flash {{ cat }}">{{ msg }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

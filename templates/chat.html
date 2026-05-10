@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}{{ chat['title'] }} — Chat DB Editor{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <p><a href="{{ url_for('index') }}">← All Chats</a></p>
+  <h1>{{ chat['title'] or '(untitled)' }}</h1>
+  <p style="font-family:monospace; font-size:11px;">{{ chat['id'] }}</p>
+</div>
+
+{% if messages %}
+  {% for msg in messages %}
+    <a href="{{ url_for('edit_message', message_id=msg['id']) }}" style="display:block; text-decoration:none;">
+      <div class="card" style="cursor:pointer;">
+        <div class="row" style="margin-bottom:.4rem;">
+          <span class="badge badge-{{ msg['role'] }}">{{ msg['role'] }}</span>
+          {% if msg['has_output'] %}
+            <span style="font-size:11px; color:var(--muted);">has output</span>
+          {% endif %}
+        </div>
+        <div style="color:var(--muted); font-size:13px; white-space:pre-wrap;">{{ msg['preview'] }}</div>
+      </div>
+    </a>
+  {% endfor %}
+{% else %}
+  <div class="card">
+    <p style="color:var(--muted);">No messages in this chat.</p>
+  </div>
+{% endif %}
+{% endblock %}

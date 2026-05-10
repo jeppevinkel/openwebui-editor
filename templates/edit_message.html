@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}Edit Message — Chat DB Editor{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <p><a href="{{ url_for('chat_view', chat_id=chat_id) }}">← Back to chat</a></p>
+  <h1>Edit Message</h1>
+  <p style="font-family:monospace; font-size:11px; margin-top:.25rem;">
+    <span class="badge badge-{{ msg['role'] }}">{{ msg['role'] }}</span>
+    &nbsp;{{ msg['id'] }}
+  </p>
+</div>
+
+<form method="post" action="{{ url_for('edit_message', message_id=msg['id']) }}">
+
+  {# ------------------------------------------------------------------ #}
+  {# CONTENT FIELD                                                       #}
+  {# ------------------------------------------------------------------ #}
+  <div class="card block-section">
+    <div class="block-label">
+      Content
+      <span class="badge" style="background:#222;color:var(--muted);">content column</span>
+    </div>
+
+    {% if msg['role'] == 'assistant' and tmpl_blocks %}
+      {# For assistant messages with output, content is auto-synced from  #}
+      {# the output blocks on save. Show read-only.                       #}
+      <textarea name="content_text" rows="6" readonly
+                style="opacity:.5; cursor:not-allowed;">{{ content_text }}</textarea>
+      <p class="note">
+        ⚙️ This field is auto-synced from the output blocks below when you save. Edit it there.
+      </p>
+    {% else %}
+      <textarea name="content_text" rows="6">{{ content_text }}</textarea>
+      {% if not is_plain %}
+        <p class="note">⚠️ Content is stored as a JSON object/array — edit raw JSON above.</p>
+      {% endif %}
+    {% endif %}
+  </div>
+
+  {# ------------------------------------------------------------------ #}
+  {# OUTPUT BLOCKS                                                       #}
+  {# ------------------------------------------------------------------ #}
+  {% if tmpl_blocks %}
+    <hr class="divider" />
+    <div style="margin-bottom:1rem;">
+      <div class="block-label" style="font-size:13px; text-transform:none; letter-spacing:0;">
+        Output Blocks
+        <span class="badge" style="background:#222;color:var(--muted);">output column</span>
+      </div>
+      <p class="note">Edit the text in each block below. Both columns are saved simultaneously.</p>
+    </div>
+
+    {% for block in tmpl_blocks %}
+      <div class="card block-section">
+        <div class="block-label">
+          <span class="badge badge-{{ block['type'] }}">{{ block['type'] }}</span>
+          block {{ block['index'] }}
+        </div>
+
+        {% for item in block['items'] %}
+          <div style="margin-bottom:{% if not loop.last %}1rem{% else %}0{% endif %};">
+            {% if block['items']|length > 1 %}
+              <label>Text segment {{ loop.index }}</label>
+            {% endif %}
+            <textarea name="{{ item['field'] }}"
+                      rows="{{ [6, (item['text']|length // 80 + 3)]|max }}">{{ item['text'] }}</textarea>
+          </div>
+        {% endfor %}
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  {# ------------------------------------------------------------------ #}
+  {# SAVE                                                                #}
+  {# ------------------------------------------------------------------ #}
+  <div class="row" style="margin-top:1.5rem;">
+    <button type="submit" class="btn btn-primary">Save changes</button>
+    <a href="{{ url_for('chat_view', chat_id=chat_id) }}" class="btn btn-ghost">Cancel</a>
+  </div>
+
+</form>
+{% endblock %}

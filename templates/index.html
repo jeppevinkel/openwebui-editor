@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Chats — Chat DB Editor{% endblock %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Chats</h1>
+  <p>Select a chat to browse and edit its messages.</p>
+</div>
+
+<form method="get" action="{{ url_for('index') }}" style="margin-bottom:1.25rem;">
+  <div class="row">
+    <input type="search" name="q" value="{{ q }}" placeholder="Search by title…" style="max-width:340px;" />
+    <button class="btn btn-ghost" type="submit">Search</button>
+    {% if q %}
+      <a class="btn btn-ghost" href="{{ url_for('index') }}">Clear</a>
+    {% endif %}
+  </div>
+</form>
+
+{% if chats %}
+  {% for chat in chats %}
+    <a href="{{ url_for('chat_view', chat_id=chat['id']) }}" style="display:block; text-decoration:none;">
+      <div class="card" style="cursor:pointer;">
+        <div class="card-title">{{ chat['title'] or '(untitled)' }}</div>
+        <div class="card-meta">{{ chat['id'] }}</div>
+      </div>
+    </a>
+  {% endfor %}
+{% else %}
+  <div class="card">
+    <p style="color:var(--muted);">No chats found{% if q %} matching "<strong>{{ q }}</strong>"{% endif %}.</p>
+  </div>
+{% endif %}
+{% endblock %}

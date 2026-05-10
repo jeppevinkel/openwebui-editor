@@ -1,0 +1,349 @@
+import html
+import re
+import sqlite3
+import json
+import os
+from datetime import datetime
+
+from flask import Flask, render_template, request, redirect, url_for, flash
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('SECRET_KEY', 'devkey-change-in-prod')
+DB_PATH = os.environ.get('DB_PATH', '/data/webui.db')
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def extract_content_text(raw):
+    """
+    Pull a plain string out of the content column.
+    Returns (is_plain_string, display_value).
+    """
+    if raw is None:
+        return True, ''
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, str):
+            return True, parsed
+        return False, json.dumps(parsed, indent=2)
+    except (json.JSONDecodeError, TypeError):
+        return True, str(raw)
+
+
+def parse_output(raw):
+    """Return the output column as a Python list, or [] on failure."""
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
+def _html_encode_reasoning(text):
+    """
+    Apply the same HTML entity encoding that Open WebUI uses on reasoning
+    text before it is embedded inside the <details> block in the content
+    column.
+
+    Confirmed from database samples:
+      &  ->  &amp;
+      <  ->  &lt;
+      >  ->  &gt;
+      "  ->  &quot;
+      '  ->  &#x27;
+
+    html.escape(quote=True) covers the first four; apostrophes need a
+    manual pass because Python's html module does not encode them by
+    default.
+    """
+    escaped = html.escape(text, quote=True)
+    # html.escape never produces "'" in its output, so this replacement
+    # is safe and will only touch apostrophes that originated in the text.
+    escaped = escaped.replace("'", "&#x27;")
+    return escaped
+
+
+def rebuild_content_from_output(blocks):
+    """
+    Reconstruct the combined content string that Open WebUI stores in the
+    content column for assistant messages.
+
+    Reasoning blocks become:
+
+        <details type="reasoning" done="true" duration="N">
+        <summary>Thought for N seconds</summary>
+        &gt; reasoning line one
+        &gt; reasoning line two
+        </details>
+
+    Rules confirmed from live database rows:
+      - The reasoning text is HTML-entity-encoded before being prefixed.
+      - Every line (including blank ones) is prefixed with "&gt; "
+        (ampersand-gt-semicolon-space).  Blank lines therefore become
+        the four characters "&gt; " with a trailing space.
+      - The summary always reads "Thought for N seconds" — Open WebUI
+        uses the plural even when N == 1.
+      - The stored `duration` field is used directly; the difference
+        between started_at / ended_at does not always round to the same
+        integer.
+
+    Message blocks contribute their plain text directly (no encoding).
+
+    All parts are joined with a single newline.
+    """
+    parts = []
+
+    for block in blocks:
+        btype = block.get('type', '')
+
+        # ------------------------------------------------------------------
+        # Reasoning block
+        # ------------------------------------------------------------------
+        if btype == 'reasoning':
+            reasoning_text = ''
+            for item in block.get('content', []):
+                if item.get('type') == 'output_text':
+                    reasoning_text = item.get('text', '')
+                    break
+
+            # Use the stored duration field directly.
+            # Computing round(ended_at - started_at) does not reproduce the
+            # stored value reliably (e.g. 1.59 s rounds to 2, but the field
+            # stores 1).
+            duration = int(block.get('duration') or 0)
+
+            # HTML-encode the reasoning text, then prefix every line with
+            # "&gt; " — blank lines become "&gt; " (trailing space included
+            # because the f-string always appends the line, which is "").
+            encoded = _html_encode_reasoning(reasoning_text)
+            quoted_lines = '\n'.join(
+                f'&gt; {line}'
+                for line in encoded.splitlines()
+            )
+
+            # Always "seconds" — Open WebUI uses the plural unconditionally.
+            parts.append(
+                f'<details type="reasoning" done="true" duration="{duration}">\n'
+                f'<summary>Thought for {duration} seconds</summary>\n'
+                f'{quoted_lines}\n'
+                f'</details>'
+            )
+
+        # ------------------------------------------------------------------
+        # Message block — plain text, no HTML encoding
+        # ------------------------------------------------------------------
+        elif btype == 'message':
+            for item in block.get('content', []):
+                if item.get('type') == 'output_text':
+                    parts.append(item.get('text', ''))
+
+    return '\n'.join(parts)
+
+
+def output_blocks_for_template(blocks):
+    """
+    Flatten the output block list into something easy to iterate in Jinja.
+    Each entry: { type, index, items: [{field, text, bi, ji}] }
+    Only blocks that contain at least one output_text item are included.
+    """
+    result = []
+    for bi, block in enumerate(blocks):
+        btype = block.get('type', 'unknown')
+        items = []
+        for ji, item in enumerate(block.get('content', [])):
+            if item.get('type') == 'output_text':
+                items.append({
+                    'field': f'out_{bi}_{ji}',
+                    'text':  item.get('text', ''),
+                    'bi': bi,
+                    'ji': ji,
+                })
+        if items:
+            result.append({'type': btype, 'index': bi, 'items': items})
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route('/')
+def index():
+    q = request.args.get('q', '').strip()
+    db = get_db()
+    if q:
+        rows = db.execute(
+            'SELECT id, title, updated_at FROM chat '
+            'WHERE title LIKE ? ORDER BY updated_at DESC LIMIT 200',
+            (f'%{q}%',)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            'SELECT id, title, updated_at FROM chat '
+            'ORDER BY updated_at DESC LIMIT 200'
+        ).fetchall()
+    db.close()
+    return render_template('index.html', chats=rows, q=q)
+
+
+@app.route('/chat/<chat_id>')
+def chat_view(chat_id):
+    db = get_db()
+    chat = db.execute('SELECT id, title FROM chat WHERE id = ?', (chat_id,)).fetchone()
+    if not chat:
+        flash('Chat not found.', 'error')
+        db.close()
+        return redirect(url_for('index'))
+
+    msgs = db.execute(
+        'SELECT id, role, content, output, created_at '
+        'FROM chat_message WHERE chat_id = ? ORDER BY created_at',
+        (chat_id,)
+    ).fetchall()
+    db.close()
+
+    messages = []
+    for m in msgs:
+        _, text = extract_content_text(m['content'])
+        # Strip the <details> block so the preview shows message text only
+        preview_text = re.sub(
+            r'<details[^>]*>.*?</details>\n?', '', text, flags=re.DOTALL
+        ).strip()
+        preview = (preview_text[:130] + '…') if len(preview_text) > 130 else preview_text
+        messages.append({
+            'id':         m['id'],
+            'role':       m['role'] or 'unknown',
+            'preview':    preview or '(no content)',
+            'has_output': bool(m['output']),
+        })
+
+    return render_template('chat.html', chat=chat, messages=messages)
+
+
+@app.route('/message/<message_id>', methods=['GET', 'POST'])
+def edit_message(message_id):
+    db = get_db()
+    msg = db.execute('SELECT * FROM chat_message WHERE id = ?', (message_id,)).fetchone()
+    if not msg:
+        flash('Message not found.', 'error')
+        db.close()
+        return redirect(url_for('index'))
+
+    chat_id = msg['chat_id']
+
+    if request.method == 'POST':
+        original_blocks = parse_output(msg['output'])
+
+        # --- Rebuild output JSON with the edited text values from the form ---
+        updated_blocks = []
+        for bi, block in enumerate(original_blocks):
+            new_block = dict(block)
+            if 'content' in block:
+                new_items = []
+                for ji, item in enumerate(block['content']):
+                    new_item = dict(item)
+                    if item.get('type') == 'output_text':
+                        key = f'out_{bi}_{ji}'
+                        if key in request.form:
+                            new_item['text'] = request.form[key]
+                    new_items.append(new_item)
+                new_block['content'] = new_items
+            updated_blocks.append(new_block)
+
+        # --- Rebuild content column ---
+        #
+        # For assistant messages: reconstruct the full combined string
+        # (HTML-encoded reasoning inside <details> + plain message text)
+        # from the updated output blocks so both columns stay in sync.
+        #
+        # For user/system messages: use the textarea directly.
+        role = msg['role'] or ''
+        is_plain, _ = extract_content_text(msg['content'])
+
+        if role == 'assistant' and updated_blocks:
+            combined = rebuild_content_from_output(updated_blocks)
+            new_content = json.dumps(combined)
+        else:
+            raw_text = request.form.get('content_text', '')
+            if is_plain:
+                new_content = json.dumps(raw_text)
+            else:
+                # Was a JSON object/array — try to round-trip it
+                try:
+                    new_content = json.dumps(json.loads(raw_text))
+                except json.JSONDecodeError:
+                    flash('Content field is not valid JSON — changes not saved.', 'error')
+                    db.close()
+                    return redirect(url_for('edit_message', message_id=message_id))
+
+        new_output = json.dumps(updated_blocks) if updated_blocks else msg['output']
+        ts = int(datetime.now().timestamp() * 1000)
+
+        db.execute(
+            'UPDATE chat_message SET content = ?, output = ?, updated_at = ? WHERE id = ?',
+            (new_content, new_output, ts, message_id)
+        )
+        db.commit()
+        db.close()
+        flash('Message saved.', 'success')
+        return redirect(url_for('edit_message', message_id=message_id))
+
+    # GET — prepare display values
+    is_plain, content_text = extract_content_text(msg['content'])
+    raw_blocks  = parse_output(msg['output'])
+    tmpl_blocks = output_blocks_for_template(raw_blocks)
+
+    db.close()
+    return render_template(
+        'edit_message.html',
+        msg=msg,
+        chat_id=chat_id,
+        content_text=content_text,
+        is_plain=is_plain,
+        tmpl_blocks=tmpl_blocks,
+    )
+
+@app.route('/debug')
+def debug():
+    import os
+    info = {
+        'DB_PATH': DB_PATH,
+        'file_exists': os.path.exists(DB_PATH),
+        'file_size_bytes': os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else None,
+    }
+
+    # List every file in the mounted directory so you can see what's actually there
+    mount_dir = os.path.dirname(DB_PATH)
+    try:
+        info['files_in_mount_dir'] = os.listdir(mount_dir)
+    except Exception as e:
+        info['files_in_mount_dir'] = str(e)
+
+    # If the file exists, list what tables SQLite can actually see
+    if info['file_exists']:
+        try:
+            db = get_db()
+            tables = db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ).fetchall()
+            info['tables'] = [row['name'] for row in tables]
+            db.close()
+        except Exception as e:
+            info['tables'] = str(e)
+
+    return info  # Flask will render this dict as JSON
+
+
+if __name__ == '__main__':
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=5000, debug=debug)
