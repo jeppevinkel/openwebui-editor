@@ -284,10 +284,10 @@ def update_chat_column(db, chat_id, output_blocks, created_at_ms,
         chat_data['messages'] = rebuild_messages_list(history)
 
         new_chat_json = json.dumps(chat_data)
-        updated_at    = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        ts = int(datetime.now().timestamp() * 1000)
         db.execute(
             'UPDATE chat SET chat = ?, updated_at = ? WHERE id = ?',
-            (new_chat_json, updated_at, chat_id)
+            (new_chat_json, ts, chat_id)
         )
 
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
