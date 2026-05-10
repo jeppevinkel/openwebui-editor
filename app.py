@@ -173,6 +173,92 @@ def output_blocks_for_template(blocks):
     return result
 
 
+def rebuild_messages_list(history):
+    """
+    Walk the history tree from root to currentId and return the flat
+    messages list that Open WebUI stores in chat.chat.messages.
+
+    The flat list is the current conversation branch in linear order.
+    Tree-structure fields (id, parentId, childrenIds) are stripped out
+    since the flat list doesn't use them.
+    """
+    messages_dict = history.get('messages', {})
+    current_id    = history.get('currentId')
+
+    if not current_id or not messages_dict:
+        return []
+
+    # Walk backwards from currentId to root, then reverse to get
+    # root -> currentId order.
+    path = []
+    node_id = current_id
+    seen = set()
+    while node_id and node_id not in seen:
+        if node_id not in messages_dict:
+            break
+        seen.add(node_id)
+        path.append(node_id)
+        node_id = messages_dict[node_id].get('parentId')
+
+    path.reverse()
+
+    _tree_keys = {'id', 'parentId', 'childrenIds'}
+    result = []
+    for msg_id in path:
+        msg   = messages_dict[msg_id]
+        entry = {k: v for k, v in msg.items() if k not in _tree_keys}
+        result.append(entry)
+
+    return result
+
+
+def update_chat_column(db, chat_id, message_id, plain_content, updated_blocks):
+    """
+    Sync the edit back into the chat table's chat JSON column.
+
+    Two locations inside that JSON are updated:
+      1. history.messages[message_id].content  — plain string (not JSON-encoded)
+      2. history.messages[message_id].output   — list of blocks
+      3. messages[]                             — flat list rebuilt from history tree
+    """
+    row = db.execute('SELECT chat FROM chat WHERE id = ?', (chat_id,)).fetchone()
+    if not row or not row['chat']:
+        return
+
+    try:
+        chat_data     = json.loads(row['chat'])
+        history       = chat_data.get('history', {})
+        history_msgs  = history.get('messages', {})
+
+        if message_id not in history_msgs:
+            # Message exists in chat_message but not in chat.history — skip
+            # silently; the tables are already out of sync for another reason.
+            return
+
+        # 1 & 2 — update the history node
+        history_msgs[message_id]['content'] = plain_content
+        if updated_blocks:
+            history_msgs[message_id]['output'] = updated_blocks
+
+        history['messages']  = history_msgs
+        chat_data['history'] = history
+
+        # 3 — rebuild the flat messages list from the updated tree
+        chat_data['messages'] = rebuild_messages_list(history)
+
+        new_chat_json = json.dumps(chat_data)
+        updated_at    = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        db.execute(
+            'UPDATE chat SET chat = ?, updated_at = ? WHERE id = ?',
+            (new_chat_json, updated_at, chat_id)
+        )
+
+    except (json.JSONDecodeError, TypeError, KeyError) as exc:
+        # Log but don't abort — chat_message has already been saved correctly.
+        app.logger.warning('Could not update chat.chat column: %s', exc)
+        flash('Warning: chat history column could not be updated.', 'error')
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -262,25 +348,23 @@ def edit_message(message_id):
 
         # --- Rebuild content column ---
         #
-        # For assistant messages: reconstruct the full combined string
-        # (HTML-encoded reasoning inside <details> + plain message text)
-        # from the updated output blocks so both columns stay in sync.
+        # plain_content  : the human-readable string stored in chat.history
+        # new_content    : JSON-encoded version stored in chat_message.content
         #
-        # For user/system messages: use the textarea directly.
-        role = msg['role'] or ''
+        role     = msg['role'] or ''
         is_plain, _ = extract_content_text(msg['content'])
 
         if role == 'assistant' and updated_blocks:
-            combined = rebuild_content_from_output(updated_blocks)
-            new_content = json.dumps(combined)
+            plain_content = rebuild_content_from_output(updated_blocks)
+            new_content   = json.dumps(plain_content)
         else:
-            raw_text = request.form.get('content_text', '')
+            plain_content = request.form.get('content_text', '')
             if is_plain:
-                new_content = json.dumps(raw_text)
+                new_content = json.dumps(plain_content)
             else:
                 # Was a JSON object/array — try to round-trip it
                 try:
-                    new_content = json.dumps(json.loads(raw_text))
+                    new_content = json.dumps(json.loads(plain_content))
                 except json.JSONDecodeError:
                     flash('Content field is not valid JSON — changes not saved.', 'error')
                     db.close()
@@ -289,14 +373,15 @@ def edit_message(message_id):
         new_output = json.dumps(updated_blocks) if updated_blocks else msg['output']
         ts = int(datetime.now().timestamp() * 1000)
 
+        # --- Save chat_message row ---
         db.execute(
             'UPDATE chat_message SET content = ?, output = ?, updated_at = ? WHERE id = ?',
             (new_content, new_output, ts, message_id)
         )
-        db.execute(
-            'UPDATE chat SET updated_at = ? WHERE id = ?',
-            (ts, chat_id)
-        )
+
+        # --- Sync the chat table's JSON column ---
+        update_chat_column(db, chat_id, message_id, plain_content, updated_blocks)
+
         db.commit()
         db.close()
         flash('Message saved.', 'success')
@@ -316,36 +401,6 @@ def edit_message(message_id):
         is_plain=is_plain,
         tmpl_blocks=tmpl_blocks,
     )
-
-@app.route('/debug')
-def debug():
-    import os
-    info = {
-        'DB_PATH': DB_PATH,
-        'file_exists': os.path.exists(DB_PATH),
-        'file_size_bytes': os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else None,
-    }
-
-    # List every file in the mounted directory so you can see what's actually there
-    mount_dir = os.path.dirname(DB_PATH)
-    try:
-        info['files_in_mount_dir'] = os.listdir(mount_dir)
-    except Exception as e:
-        info['files_in_mount_dir'] = str(e)
-
-    # If the file exists, list what tables SQLite can actually see
-    if info['file_exists']:
-        try:
-            db = get_db()
-            tables = db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            ).fetchall()
-            info['tables'] = [row['name'] for row in tables]
-            db.close()
-        except Exception as e:
-            info['tables'] = str(e)
-
-    return info  # Flask will render this dict as JSON
 
 
 if __name__ == '__main__':
