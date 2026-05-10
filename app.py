@@ -293,6 +293,10 @@ def edit_message(message_id):
             'UPDATE chat_message SET content = ?, output = ?, updated_at = ? WHERE id = ?',
             (new_content, new_output, ts, message_id)
         )
+        db.execute(
+            'UPDATE chat SET updated_at = ? WHERE id = ?',
+            (ts, chat_id)
+        )
         db.commit()
         db.close()
         flash('Message saved.', 'success')
